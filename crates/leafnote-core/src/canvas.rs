@@ -8,7 +8,7 @@ use crate::model::{PenKind, Point, Rect, Stroke};
 
 /// Axis-aligned bounding box of a stroke (with half-width padding).
 pub fn stroke_bounding_box(s: &Stroke) -> Rect {
-    let pad = s.width_mm.max(0.5);
+    let pad = (s.width_mm / 2.0).max(0.5);
     if s.points.is_empty() {
         return Rect::default();
     }

@@ -5,3 +5,9 @@ edition.workspace = true
 [[bin]]
 name = "leafnote"
 path = "src/main.rs"
+
+[dependencies]
+iced = { version = "0.13", features = ["canvas", "image"] }
+lyon_path.workspace = true
+lyon_tessellation.workspace = true
+rfd = "0.14"

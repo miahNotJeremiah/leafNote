@@ -156,23 +156,21 @@ impl SearchIndex {
         walk(self, nb_id, tree, &mut Vec::new(), pages_of);
     }
 
-    /// Search all notebooks. Multi-word queries are AND-combined; results are
-    /// ranked by a light BM25-ish score (term frequency / sqrt length), with
-    /// title matches weighted double.
+    /// Search all notebooks. Multi-word queries are AND-combined **per page**:
+    /// a page is returned only if it contains *every* query token (matched by
+    /// prefix). Results are ranked by a light BM25-ish score (term frequency /
+    /// sqrt length), with title matches weighted double.
     pub fn search(&self, query: &str, limit: usize) -> Vec<SearchHit> {
         let qtoks = tokenize(query);
         if qtoks.is_empty() {
             return Vec::new();
         }
-        let mut scores: HashMap<Id, f64> = HashMap::new();
-        let mut matched_all = true;
+        // Per-token candidate sets; intersect at the end for AND semantics.
+        let mut per_token: Vec<HashMap<Id, f64>> = Vec::with_capacity(qtoks.len());
         for qt in &qtoks {
-            // prefix match so "note" finds "notes"; exact first if available.
-            let keys: Vec<&String> = if let Some(exact) = self.postings.get(qt) {
-                vec![(qt, exact)]
-                    .into_iter()
-                    .map(|(k, _)| k)
-                    .collect()
+            // Prefix match so "note" finds "notes"; exact first if available.
+            let keys: Vec<&String> = if self.postings.contains_key(qt) {
+                vec![qt]
             } else {
                 self.postings
                     .keys()
@@ -180,20 +178,31 @@ impl SearchIndex {
                     .collect()
             };
             if keys.is_empty() {
-                matched_all = false;
-                break;
+                return Vec::new(); // this token appears nowhere -> AND fails
             }
+            let mut scores: HashMap<Id, f64> = HashMap::new();
             for key in keys {
                 if let Some(posting) = self.postings.get(key) {
                     for (doc, tf) in posting {
                         let len = self.doc_total_len.get(doc).copied().unwrap_or(1).max(1) as f64;
-                        *scores.entry(*doc).or_insert(0.0) +=
-                            (*tf as f64) / len.sqrt();
+                        *scores.entry(*doc).or_insert(0.0) += (*tf as f64) / len.sqrt();
                     }
                 }
             }
+            per_token.push(scores);
         }
-        if !matched_all {
+        // Intersect: keep only docs that matched every token, summing scores.
+        let mut iter = per_token.into_iter();
+        let mut scores: HashMap<Id, f64> = iter.next().unwrap();
+        for next in iter {
+            scores.retain(|doc, _| next.contains_key(doc));
+            for (doc, s) in &next {
+                if let Some(cur) = scores.get_mut(doc) {
+                    *cur += s;
+                }
+            }
+        }
+        if scores.is_empty() {
             return Vec::new();
         }
         // Boost title matches.
@@ -337,8 +346,14 @@ mod tests {
     #[test]
     fn multi_word_and_semantics() {
         let (idx, _, _, _) = sample();
+        // Both words live on the "Meeting notes" page -> 1 hit.
         assert_eq!(idx.search("budget hiring", 10).len(), 1);
+        // "budget" is only on p1, "groceries" only on p2: no single page has
+        // both, so AND semantics must return nothing (regression test for a
+        // global per-token match that wrongly OR-ed results together).
         assert!(idx.search("budget groceries", 10).is_empty());
+        // A token that appears nowhere rejects the whole query.
+        assert!(idx.search("budget zebra", 10).is_empty());
     }
 
     #[test]
