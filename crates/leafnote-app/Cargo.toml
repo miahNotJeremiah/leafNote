@@ -1,0 +1,7 @@
+[package]
+name = "leafnote-app"
+version.workspace = true
+edition.workspace = true
+[[bin]]
+name = "leafnote"
+path = "src/main.rs"

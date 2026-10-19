@@ -1,0 +1,27 @@
+[package]
+name = "leafnote-core"
+description = "leafNote core: local-first notebook storage model, OneNote (.one/.onetoc2/.onepkg) import engine, and full-text search. No GUI dependencies."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+onenote_parser.workspace = true
+typed-path.workspace = true
+time.workspace = true
+
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+
+anyhow.workspace = true
+thiserror.workspace = true
+dirs.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
