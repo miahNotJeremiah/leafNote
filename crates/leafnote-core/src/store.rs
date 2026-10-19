@@ -98,23 +98,35 @@ impl Store {
 
     /// Create a brand-new empty section inside `notebook` and persist it.
     pub fn create_section(&mut self, notebook: Id, name: &str) -> Result<Id> {
-        let dir = self.notebook_dir(notebook).ok_or(CoreError::NotFound("notebook".into()))?;
-        let mut section = Section::new(name);
-        section.origin = Some("leafnote".into());
-        let sec_id = section.id;
-        write_json(&dir.join("sections").join(format!("{sec_id}.json")), &section)?;
-        self.sections.entry(dir.clone()).or_default().insert(sec_id, section);
+        let sec = self.register_section(notebook, Section::new(name))?;
+        Ok(sec.id)
+    }
 
+    /// Insert an already-built [`Section`] (created or imported) into the
+    /// notebook's index files and tree, persisting both.
+    pub fn register_section(&mut self, notebook: Id, section: Section) -> Result<Section> {
+        let dir = self
+            .notebook_dir(notebook)
+            .ok_or_else(|| CoreError::NotFound(format!("notebook {notebook}")))?;
+        let sec_id = section.id;
+        std::fs::create_dir_all(dir.join("sections"))?;
+        write_json(&dir.join("sections").join(format!("{sec_id}.json")), &section)?;
+        self.sections
+            .entry(dir)
+            .or_default()
+            .insert(sec_id, section.clone());
+
+        let read_only = section.read_only;
         if let Some(nb) = self.notebook_mut(notebook) {
             nb.root.push(TreeNode::Section(crate::model::SectionRef {
                 id: sec_id,
-                name: name.into(),
-                color: None,
-                read_only: false,
+                name: section.name.clone(),
+                color: section.color,
+                read_only,
             }));
             save_tree(nb)?;
         }
-        Ok(sec_id)
+        Ok(section)
     }
 
     pub fn section(&self, id: Id) -> Option<&Section> {
@@ -242,9 +254,35 @@ impl Store {
 // ---------------------------------------------------------------------------
 
 #[derive(serde::Serialize, serde::Deserialize)]
-struct NotebookMeta {
+pub(crate) struct NotebookMeta {
     version: u32,
     notebook: Notebook,
+}
+
+/// Public mirror of the `tree.json` envelope so the import engine can write
+/// notebooks without duplicating the format definition.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct NotebookMetaFile {
+    pub version: u32,
+    pub notebook: Notebook,
+}
+
+impl From<&NotebookMetaFile> for NotebookMeta {
+    fn from(m: &NotebookMetaFile) -> Self {
+        NotebookMeta {
+            version: m.version,
+            notebook: m.notebook.clone(),
+        }
+    }
+}
+
+impl From<&NotebookMeta> for NotebookMetaFile {
+    fn from(m: &NotebookMeta) -> Self {
+        NotebookMetaFile {
+            version: m.version,
+            notebook: m.notebook.clone(),
+        }
+    }
 }
 
 impl NotebookMeta {
@@ -266,7 +304,7 @@ impl NotebookMeta {
 }
 
 fn save_tree(nb: &Notebook) -> Result<()> {
-    let meta = NotebookMeta {
+    let meta = NotebookMetaFile {
         version: crate::FORMAT_VERSION,
         notebook: nb.clone(),
     };
@@ -326,17 +364,14 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Lightweight SHA-256 (no external deps) used for content-addressed media.
+/// Content-addressed media hashing (SHA-256, hex digest).
 pub fn sha256_hex(data: &[u8]) -> String {
-    use Sha256;
-    let digest = Sha256::digest(data);
+    let digest = soft_sha256(data);
     digest.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Minimal, dependency-free SHA-256 implementation (FIPS 180-4).
-struct Sha256;
-
-impl Sha256 {
+/// Pure-Rust SHA-256 (FIPS 180-4).
+fn soft_sha256(msg: &[u8]) -> [u8; 32] {
     const K: [u32; 64] = [
         0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c257, 0x59f111f1, 0x923f82a4,
         0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
@@ -349,66 +384,63 @@ impl Sha256 {
         0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
         0xc67178f2,
     ];
-
-    fn digest(msg: &[u8]) -> [u8; 32] {
-        let mut h: [u32; 8] = [
-            0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
-            0x5be0cd19,
-        ];
-        // Padding.
-        let bitlen = (msg.len() as u64) * 8;
-        let mut data = msg.to_vec();
-        data.push(0x80);
-        while data.len() % 64 != 56 {
-            data.push(0);
-        }
-        data.extend_from_slice(&bitlen.to_be_bytes());
-
-        for block in data.chunks(64) {
-            let mut w = [0u32; 64];
-            for i in 0..16 {
-                w[i] = u32::from_be_bytes(block[i * 4..i * 4 + 4].try_into().unwrap());
-            }
-            for i in 16..64 {
-                let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
-                let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
-                w[i] = w[i - 16]
-                    .wrapping_add(s0)
-                    .wrapping_add(w[i - 7])
-                    .wrapping_add(s1);
-            }
-            let (mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh) =
-                (h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]);
-            for i in 0..64 {
-                let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
-                let ch = (e & f) ^ ((!e) & g);
-                let t1 = hh
-                    .wrapping_add(s1)
-                    .wrapping_add(ch)
-                    .wrapping_add(Self::K[i])
-                    .wrapping_add(w[i]);
-                let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
-                let maj = (a & b) ^ (a & c) ^ (b & c);
-                let t2 = s0.wrapping_add(maj);
-                hh = g;
-                g = f;
-                f = e;
-                e = d.wrapping_add(t1);
-                d = c;
-                c = b;
-                b = a;
-                a = t1.wrapping_add(t2);
-            }
-            for (x, v) in h.iter_mut().zip([a, b, c, d, e, f, g, hh]) {
-                *x = x.wrapping_add(v);
-            }
-        }
-        let mut out = [0u8; 32];
-        for (i, w) in h.iter().enumerate() {
-            out[i * 4..i * 4 + 4].copy_from_slice(&w.to_be_bytes());
-        }
-        out
+    let mut h: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+        0x5be0cd19,
+    ];
+    let bitlen = (msg.len() as u64) * 8;
+    let mut data = msg.to_vec();
+    data.push(0x80);
+    while data.len() % 64 != 56 {
+        data.push(0);
     }
+    data.extend_from_slice(&bitlen.to_be_bytes());
+
+    for block in data.chunks(64) {
+        let mut w = [0u32; 64];
+        for i in 0..16 {
+            w[i] = u32::from_be_bytes(block[i * 4..i * 4 + 4].try_into().unwrap());
+        }
+        for i in 16..64 {
+            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[i - 7])
+                .wrapping_add(s1);
+        }
+        let (mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh) =
+            (h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]);
+        for i in 0..64 {
+            // Sigma functions must use ROTATE, not SHIFT (common typo!).
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let ch = (e & f) ^ ((!e) & g);
+            let t1 = hh
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(K[i])
+                .wrapping_add(w[i]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let t2 = s0.wrapping_add(maj);
+            hh = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(t1);
+            d = c;
+            c = b;
+            b = a;
+            a = t1.wrapping_add(t2);
+        }
+        for (x, v) in h.iter_mut().zip([a, b, c, d, e, f, g, hh]) {
+            *x = x.wrapping_add(v);
+        }
+    }
+    let mut out = [0u8; 32];
+    for (i, wv) in h.iter().enumerate() {
+        out[i * 4..i * 4 + 4].copy_from_slice(&wv.to_be_bytes());
+    }
+    out
 }
 
 #[cfg(test)]

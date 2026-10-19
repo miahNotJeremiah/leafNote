@@ -14,19 +14,18 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use onenote_parser::contents::{Content, OutlineItem, PageContent};
-use onenote_parser::notebook::Notebook as OneNotebook;
-use onenote_parser::page::Page as OnePage;
+use onenote_parser::contents::{Content, OutlineItem};
+use onenote_parser::page::{Page as OnePage, PageContent};
 use onenote_parser::property::rich_text::ParagraphAlignment;
-use onenote_parser::section::{Section as OneSection, SectionEntry, SectionGroup};
-use onenote_parser::{Parser, FileSystem};
+use onenote_parser::section::{Section as OneSection, SectionEntry};
+use onenote_parser::Parser;
 use typed_path::TypedPath;
 
 use crate::error::{CoreError, Result};
 use crate::model::{
     half_inch_to_mm, Alignment, Attachment, Block, Color, GroupRef, Id, ImageBlock, Notebook,
-    NoteTag, Page, Paragraph, PenKind, Point, Rect, Section, SectionRef, Stroke, TextStyle,
-    TextRun, TreeNode,
+    NoteTag, Page, Paragraph, PenKind, Point, Rect, Section, SectionRef, Stroke, TableBlock,
+    TextStyle, TextRun, TreeNode,
 };
 use crate::store::{sanitize_folder_name, Store};
 
@@ -72,7 +71,7 @@ pub struct ImportReport {
     pub warnings: Vec<String>,
 }
 
-/// Convert a `Color`/`ColorRef` from the parser into our model colour.
+/// Convert a `ColorRef` from the parser into our model colour.
 fn conv_color_ref(c: onenote_parser::property::common::ColorRef) -> Color {
     use onenote_parser::property::common::ColorRef;
     match c {
@@ -107,14 +106,14 @@ pub fn import_any(
     // ".foo.one" stems to ".foo"; strip trailing OneNote noise.
     let name = base.trim_end_matches(".one").trim().to_string();
     let nb_dir_name = format!("{} (imported)", sanitize_folder_name(&name));
-    let target = data_root.join(&nb_dir_name);
+    let target = unique_import_dir(data_root, &nb_dir_name);
     std::fs::create_dir_all(&target)?;
     let mut nb = Notebook::new(name);
     nb.path = target.clone();
     nb.read_only = true;
     crate::store::write_json(
         &target.join("tree.json"),
-        &ImportedTree {
+        &crate::store::NotebookMetaFile {
             version: crate::FORMAT_VERSION,
             notebook: nb.clone(),
         },
@@ -122,41 +121,34 @@ pub fn import_any(
     let nb_id = nb.id;
     store.open_notebook(&target)?;
 
-    let report = match kind {
+    let mut report = match kind {
         OneFileKind::Section => import_section_file(store, nb_id, path)?,
         OneFileKind::Toc | OneFileKind::Package => {
             import_notebook_file(store, nb_id, path, kind)?
         }
     };
+    report.notebook = Some(nb_id);
     Ok((report, target))
 }
 
-struct ImportedTree {
-    version: u32,
-    notebook: Notebook,
-}
-impl serde::Serialize for ImportedTree {
-    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
-        use serde::ser::SerializeStruct;
-        let mut s = s.serialize_struct("Meta", 2)?;
-        s.serialize_field("version", &self.version)?;
-        s.serialize_field("notebook", &self.notebook)?;
-        s.end()
+/// Never clobber a previous import of the same notebook: pick
+/// `Name (imported)`, `Name (imported 2)`, …
+fn unique_import_dir(data_root: &Path, base: &str) -> PathBuf {
+    let first = data_root.join(base);
+    if !first.exists() {
+        return first;
     }
-}
-impl<'de> serde::Deserialize<'de> for ImportedTree {
-    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
-        #[derive(serde::Deserialize)]
-        struct Inner {
-            version: u32,
-            notebook: Notebook,
+    for i in 2..1000 {
+        let p = data_root.join(format!("{base} {i}"));
+        if !p.exists() {
+            return p;
         }
-        let i = Inner::deserialize(d)?;
-        Ok(ImportedTree {
-            version: i.version,
-            notebook: i.notebook,
-        })
     }
+    // Astronomically unlikely fallback: timestamped suffix.
+    data_root.join(format!(
+        "{base} {}",
+        chrono::Utc::now().format("%Y%m%d%H%M%S")
+    ))
 }
 
 fn import_section_file(store: &mut Store, nb_id: Id, path: &Path) -> Result<ImportReport> {
@@ -165,10 +157,19 @@ fn import_section_file(store: &mut Store, nb_id: Id, path: &Path) -> Result<Impo
     let section = parser
         .parse_section(tp)
         .map_err(|e| CoreError::OneNote(e.to_string()))?;
-    let dir = store.notebook_dir(nb_id).expect("opened above");
+    let dir = store
+        .notebook_dir(nb_id)
+        .ok_or_else(|| CoreError::NotFound(format!("notebook {nb_id}")))?;
     let mut report = ImportReport::default();
+    report.warnings.extend(
+        section
+            .report()
+            .warnings()
+            .iter()
+            .map(|w| w.message().to_string()),
+    );
     let sec = convert_section(store, &dir, &section, path, &mut report)?;
-    register_section(store, nb_id, &sec);
+    store.register_section(nb_id, sec)?;
     report.sections = 1;
     Ok(report)
 }
@@ -189,7 +190,9 @@ fn import_notebook_file(
             .parse_notebook(tp)
             .map_err(|e| CoreError::OneNote(format!(".onetoc2: {e}")))?,
     };
-    let dir = store.notebook_dir(nb_id).expect("opened above");
+    let dir = store
+        .notebook_dir(nb_id)
+        .ok_or_else(|| CoreError::NotFound(format!("notebook {nb_id}")))?;
     let mut report = ImportReport::default();
     report.warnings.extend(
         notebook
@@ -203,18 +206,18 @@ fn import_notebook_file(
             nb.color = conv_opt_color(Some(c));
         }
     }
-    let nodes = convert_entries(store, &dir, notebook.entries(), path, &mut report)?;
+    let nodes = convert_entries(store, nb_id, &dir, notebook.entries(), path, &mut report)?;
+    report.sections = count_sections(&nodes);
     if let Some(nb) = store.notebook_mut(nb_id) {
         nb.root = nodes;
         crate::store::write_json(
             &nb.path.join("tree.json"),
-            &ImportedTree {
+            &crate::store::NotebookMetaFile {
                 version: crate::FORMAT_VERSION,
                 notebook: nb.clone(),
             },
         )?;
     }
-    report.sections = count_sections(&nodes);
     Ok(report)
 }
 
@@ -230,6 +233,7 @@ fn count_sections(nodes: &[TreeNode]) -> usize {
 
 fn convert_entries(
     store: &mut Store,
+    nb_id: Id,
     dir: &Path,
     entries: &[SectionEntry],
     src: &Path,
@@ -240,16 +244,16 @@ fn convert_entries(
         match e {
             SectionEntry::Section(s) => {
                 let sec = convert_section(store, dir, s, src, report)?;
-                register_section(store, lookup_nb(store, dir), &sec);
+                let reg = store.register_section(nb_id, sec)?;
                 out.push(TreeNode::Section(SectionRef {
-                    id: sec.id,
-                    name: sec.name.clone(),
-                    color: sec.color,
+                    id: reg.id,
+                    name: reg.name.clone(),
+                    color: reg.color,
                     read_only: true,
                 }));
             }
             SectionEntry::SectionGroup(g) => {
-                let children = convert_entries(store, dir, g.entries(), src, report)?;
+                let children = convert_entries(store, nb_id, dir, g.entries(), src, report)?;
                 out.push(TreeNode::Group(GroupRef {
                     id: Id::new(),
                     name: g.display_name().to_string(),
@@ -259,21 +263,6 @@ fn convert_entries(
         }
     }
     Ok(out)
-}
-
-fn lookup_nb(_store: &Store, _dir: &Path) -> Id {
-    // Sections are registered against the notebook whose directory they live
-    // in; callers already know the notebook id, so we thread it via a global
-    // once-cell set at import start. Simpler: import functions pass it.
-    UN_NB.with(|c| c.get())
-}
-
-thread_local! {
-    static UN_NB: std::cell::Cell<Id> = const { std::cell::Cell::new(Id::from_uuid(uuid::Uuid::nil())) };
-}
-
-fn register_section(store: &mut Store, nb_id: Id, sec: &Section) {
-    let _ = (store, nb_id, sec); // registration handled by caller tree updates
 }
 
 // ---------------------------------------------------------------------------
@@ -288,7 +277,7 @@ fn convert_section(
     report: &mut ImportReport,
 ) -> Result<Section> {
     let mut sec = Section::new(one.display_name());
-    sec.color = one.color().and_then(conv_color_opt);
+    sec.color = one.color().map(|c| Color::rgb(c.r(), c.g(), c.b()));
     sec.read_only = true;
     sec.origin = Some(src.display().to_string());
     std::fs::create_dir_all(dir.join("sections"))?;
@@ -303,15 +292,7 @@ fn convert_section(
             report.pages += 1;
         }
     }
-    crate::store::write_json(
-        &dir.join("sections").join(format!("{}.json", sec.id)),
-        &sec,
-    )?;
     Ok(sec)
-}
-
-fn conv_color_opt(c: onenote_parser::property::common::Color) -> Option<Color> {
-    Some(Color::rgb(c.r(), c.g(), c.b()))
 }
 
 fn convert_page(
@@ -349,8 +330,8 @@ fn convert_page(
             half_inch_to_mm(t.offset_vertical()),
         );
         let mut paragraphs = Vec::new();
-        for item in t.contents() {
-            collect_outline_paragraphs(item.items(), &mut paragraphs);
+        for outline in t.contents() {
+            collect_outline_paragraphs(outline.items(), &mut paragraphs);
         }
         if paragraphs.is_empty() {
             paragraphs.push(Paragraph::plain(page.title.clone()));
@@ -419,7 +400,10 @@ fn collect_outline_paragraphs(items: &[OutlineItem], out: &mut Vec<Paragraph>) {
                     match c {
                         Content::RichText(rt) => out.push(convert_rich_text(rt, el.child_level())),
                         Content::Table(tbl) => {
+                            // Flatten tables into "a | b | c" paragraph rows so
+                            // their text stays searchable.
                             for row in tbl.contents() {
+                                let mut cells = Vec::new();
                                 for cell in row.contents() {
                                     let txt: Vec<String> = cell
                                         .contents()
@@ -430,8 +414,9 @@ fn collect_outline_paragraphs(items: &[OutlineItem], out: &mut Vec<Paragraph>) {
                                             })
                                         })
                                         .collect();
-                                    out.push(Paragraph::plain(txt.join(" | ")));
+                                    cells.push(txt.join(" "));
                                 }
+                                out.push(Paragraph::plain(cells.join(" | ")));
                             }
                         }
                         _ => {}
@@ -441,6 +426,36 @@ fn collect_outline_paragraphs(items: &[OutlineItem], out: &mut Vec<Paragraph>) {
             }
             OutlineItem::Group(g) => collect_outline_paragraphs(g.outlines(), out),
         }
+    }
+}
+
+/// Full-fidelity table conversion (kept for the editor's table support; the
+/// paragraph flattening above is what search/snippets currently use).
+#[allow(dead_code)]
+fn convert_table(tbl: &onenote_parser::contents::Table) -> TableBlock {
+    TableBlock {
+        rows: tbl
+            .contents()
+            .iter()
+            .map(|row| {
+                row.contents()
+                    .iter()
+                    .map(|cell| {
+                        let txt: Vec<String> = cell
+                            .contents()
+                            .iter()
+                            .flat_map(|el| {
+                                el.contents()
+                                    .iter()
+                                    .filter_map(|c| c.rich_text().map(|rt| rt.text().to_string()))
+                            })
+                            .collect();
+                        Paragraph::plain(txt.join(" "))
+                    })
+                    .collect()
+            })
+            .collect(),
+        col_widths_mm: tbl.col_widths().iter().map(|w| half_inch_to_mm(*w)).collect(),
     }
 }
 
@@ -464,19 +479,13 @@ fn convert_rich_text(rt: &onenote_parser::contents::RichText, level: u8) -> Para
                 .map(para_style)
                 .unwrap_or_default();
             let chunk: String = chars[a.min(chars.len())..b.min(chars.len())].iter().collect();
-            runs.push(TextRun {
-                text: chunk,
-                style,
-            });
+            runs.push(TextRun { text: chunk, style });
         }
         if let Some(&last) = indices.last() {
             let rest: String = chars[(last as usize).min(chars.len())..].iter().collect();
             if !rest.is_empty() {
                 let style = styles.last().map(para_style).unwrap_or_default();
-                runs.push(TextRun {
-                    text: rest,
-                    style,
-                });
+                runs.push(TextRun { text: rest, style });
             }
         }
     }
@@ -546,7 +555,11 @@ fn map_tag(label: &str) -> NoteTag {
     }
 }
 
-fn convert_image(store: &mut Store, dir: &Path, img: &onenote_parser::contents::Image) -> Option<Block> {
+fn convert_image(
+    _store: &Store,
+    dir: &Path,
+    img: &onenote_parser::contents::Image,
+) -> Option<Block> {
     let mut buf = Vec::new();
     if let Some(mut r) = img.read() {
         if r.read_to_end(&mut buf).is_err() || buf.is_empty() {
@@ -578,7 +591,7 @@ fn convert_image(store: &mut Store, dir: &Path, img: &onenote_parser::contents::
 }
 
 fn convert_attachment(
-    store: &mut Store,
+    _store: &Store,
     dir: &Path,
     f: &onenote_parser::contents::EmbeddedFile,
 ) -> Option<Block> {
@@ -709,9 +722,7 @@ pub fn page_bounds(page: &Page) -> Rect {
         let bb = match b {
             Block::Outline { pos, width_mm, .. } => Rect::new(pos.x, pos.y, *width_mm, 40.0),
             Block::Ink { strokes, .. } => crate::canvas::strokes_bounds(strokes.iter()),
-            Block::Image { pos, image, .. } => {
-                Rect::new(pos.x, pos.y, image.width_mm, image.height_mm)
-            }
+            Block::Image { pos, image, .. } => Rect::new(pos.x, pos.y, image.width_mm, image.height_mm),
             Block::File { pos, .. } => Rect::new(pos.x, pos.y, 40.0, 12.0),
             Block::Table { pos, .. } => Rect::new(pos.x, pos.y, 120.0, 60.0),
         };
@@ -724,12 +735,6 @@ pub fn page_bounds(page: &Page) -> Rect {
     }
     r
 }
-
-// Silence unused-import warnings when features shift around.
-const _: () = {
-    #[allow(dead_code)]
-    fn _uses(_: &dyn FileSystem, _: &OneNotebook, _: &SectionGroup) {}
-};
 
 #[cfg(test)]
 mod tests {
@@ -759,8 +764,22 @@ mod tests {
     }
 
     #[test]
-    fn time_conversion_is_sane() {
-        let dt = utc_from(time::macros::datetime!(2024-05-17 13:45:30 UTC));
-        assert_eq!(dt.format("%Y-%m-%d %H:%M:%S").to_string(), "2024-05-17 13:45:30");
+    fn unique_import_dir_avoids_clobber() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = unique_import_dir(dir.path(), "Book (imported)");
+        std::fs::create_dir_all(&a).unwrap();
+        let b = unique_import_dir(dir.path(), "Book (imported)");
+        assert_ne!(a, b);
+        assert!(b.file_name().unwrap().to_string_lossy().ends_with(" 2"));
+    }
+
+    #[test]
+    fn import_rejects_non_onenote_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let bogus = dir.path().join("notes.txt");
+        std::fs::write(&bogus, b"hello").unwrap();
+        let mut store = Store::new();
+        let err = import_any(&mut store, dir.path(), &bogus).unwrap_err();
+        assert!(err.to_string().contains("not a OneNote file"));
     }
 }

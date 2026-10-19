@@ -39,6 +39,8 @@ mod error {
         Serde(#[from] serde_json::Error),
         #[error("TOML error: {0}")]
         Toml(#[from] toml::de::Error),
+        #[error("TOML serialization error: {0}")]
+        TomlSer(#[from] toml::ser::Error),
         #[error("OneNote parse error: {0}")]
         OneNote(String),
         #[error("not found: {0}")]
