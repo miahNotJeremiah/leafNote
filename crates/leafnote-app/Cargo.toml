@@ -7,7 +7,12 @@ name = "leafnote"
 path = "src/main.rs"
 
 [dependencies]
+leafnote-core.workspace = true
 iced = { version = "0.13", features = ["canvas", "image"] }
 lyon_path.workspace = true
 lyon_tessellation.workspace = true
 rfd = "0.14"
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+dirs.workspace = true
