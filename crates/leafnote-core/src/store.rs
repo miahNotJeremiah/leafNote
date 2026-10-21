@@ -90,6 +90,13 @@ impl Store {
         self.notebooks.iter_mut().find(|n| n.id == id)
     }
 
+    /// Detach a notebook from the in-memory registry (the folder on disk is
+    /// left untouched — closing never deletes data).
+    pub fn close_notebook(&mut self, id: Id) {
+        self.notebooks.retain(|n| n.id != id);
+        self.pages.remove(&id);
+    }
+
     pub fn notebook_dir(&self, id: Id) -> Option<PathBuf> {
         self.notebooks.iter().find(|n| n.id == id).map(|n| n.path.clone())
     }
