@@ -2071,6 +2071,7 @@ dependencies = [
  "anyhow",
  "dirs 5.0.1",
  "iced",
+ "iced_core",
  "leafnote-core",
  "lyon_path",
  "lyon_tessellation",

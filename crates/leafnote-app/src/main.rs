@@ -14,16 +14,15 @@ mod state;
 use std::path::{Path, PathBuf};
 
 use iced::widget::canvas::{
-    self, Event, Frame, Geometry, Path as CPath, Program, Stroke as CStroke, Text as CText,
+    self, Event, Frame, Geometry, Image as CanvasImage, LineCap, LineDash, LineJoin, Path as CPath,
+    Program, Stroke as CStroke, Style as CanvasStyle, Text as CText,
 };
+pub use iced_core::mouse::Cursor;
 use iced::widget::{
     button, column, container, horizontal_space, row, scrollable, text, text_input,
     vertical_space, Column, Space,
 };
-use iced::{theme, Element, Length, Size, Task, Theme};
-
-/// Canvas-local event state kept by the `Program` implementation.
-type DrawState = canvas::event::State;
+use iced::{mouse, Element, Length, Size, Task, Theme};
 
 use leafnote_core::model::{Block, Color, Id, NoteTag, PenKind, Point};
 use leafnote_core::search::SearchHit;
@@ -34,8 +33,8 @@ const APP_TITLE: &str = "leafNote — local-first notebooks";
 
 fn main() -> iced::Result {
     let startup_file: Option<PathBuf> = std::env::args().nth(1).map(PathBuf::from);
-    iced::application(App::title, App::update, App::view)
-        .subscription(App::subscription)
+    iced::application(title_of, update_of, view_of)
+        .subscription(subscription_of)
         .run_with(move || {
             let mut app = App::new();
             if let Some(p) = startup_file {
@@ -47,6 +46,26 @@ fn main() -> iced::Result {
             }
             (app, Task::none())
         })
+}
+
+fn title_of(_s: &App) -> String {
+    APP_TITLE.to_string()
+}
+
+fn update_of(state: &mut App, msg: Msg) -> Task<Msg> {
+    state.update(msg)
+}
+
+fn view_of(state: &App) -> Element<'_, Msg> {
+    state.view()
+}
+
+fn subscription_of(_state: &App) -> iced::Subscription<Msg> {
+    // Autosave heartbeat. A periodic Subscription requires an async-runtime
+    // feature (tokio/async-std/smol); to keep the dependency graph minimal we
+    // instead autosave opportunistically on every user interaction (see
+    // `AppState::update`) and flush on window close / notebook switch.
+    iced::Subscription::none()
 }
 
 pub struct App {
@@ -119,10 +138,6 @@ impl App {
             ),
             None => Task::none(),
         }
-    }
-
-    fn title(&self, _s: &App) -> String {
-        APP_TITLE.to_string()
     }
 
     fn update(&mut self, msg: Msg) -> Task<Msg> {
@@ -236,26 +251,21 @@ impl App {
         }
     }
 
-    fn view(&self, app: &App) -> Element<'_, Msg> {
-        let st = &app.state;
+    fn view(&self) -> Element<'_, Msg> {
+        let st = &self.state;
         let header = header_view(st);
         let body = row![
-            sidebar_view(st).width(Length::Fixed(290.0)),
+            container(sidebar_view(st)).width(Length::Fixed(290.0)),
             vertical_line(),
-            canvas_column(st).fill(),
+            container(canvas_column(st)).width(Length::Fill),
             vertical_line(),
-            inspector_view(st).width(Length::Fixed(310.0)),
+            container(inspector_view(st)).width(Length::Fixed(310.0)),
         ];
         let footer = status_bar(st);
         container(column![header, body.height(Length::Fill), footer].spacing(0))
             .width(Length::Fill)
             .height(Length::Fill)
             .into()
-    }
-
-    fn subscription(&self) -> iced::Subscription<Msg> {
-        // Autosave heartbeat: flush dirty state every 5 s (OneNote-like).
-        iced::time::every(std::time::Duration::from_millis(5_000)).map(|_| Msg::Tick)
     }
 }
 
@@ -279,15 +289,15 @@ fn open_in_os(path: &Path) {
 fn header_view(st: &AppState) -> Element<'_, Msg> {
     let tool_btn = |t: Tool, label: &'static str| {
         button(text(label).size(13))
-            .padding([4, 10])
+            .padding(4)
             .style(move |th: &Theme, status| {
-                let base = theme::Button::primary(th, status);
+                let base = iced::widget::button::primary(th, status);
                 if st.tool == t {
                     iced::widget::button::Style {
                         background: Some(iced::Background::Color(iced::Color::from_rgb(
                             0.16, 0.42, 0.85,
                         ))),
-                        text_color: Some(iced::Color::WHITE),
+                        text_color: iced::Color::WHITE,
                         ..base
                     }
                 } else {
@@ -299,7 +309,7 @@ fn header_view(st: &AppState) -> Element<'_, Msg> {
 
     let ro_badge: Element<'_, Msg> = if st.is_read_only() && st.page().is_some() {
         container(text("🔒 read-only import").size(12))
-            .padding([2, 8])
+            .padding(2)
             .style(|_: &Theme| container::Style {
                 background: Some(iced::Background::Color(iced::Color::from_rgb(0.97, 0.82, 0.35))),
                 text_color: Some(iced::Color::BLACK),
@@ -323,18 +333,18 @@ fn header_view(st: &AppState) -> Element<'_, Msg> {
         tool_btn(Tool::Highlighter, "🖍 Highlight"),
         tool_btn(Tool::Eraser, "⌫ Erase"),
         Space::with_width(12),
-        button(text("－").size(15)).padding([3, 8]).on_press(Msg::ZoomOut),
-        button(text("＋").size(15)).padding([3, 8]).on_press(Msg::ZoomIn),
-        button(text("⤢ Fit").size(12)).padding([3, 8]).on_press(Msg::ResetView),
+        button(text("－").size(15)).padding(3).on_press(Msg::ZoomOut),
+        button(text("＋").size(15)).padding(3).on_press(Msg::ZoomIn),
+        button(text("⤢ Fit").size(12)).padding(3).on_press(Msg::ResetView),
         Space::with_width(Length::Fill),
         ro_badge,
         Space::with_width(12),
         text(save_state).size(12),
         Space::with_width(12),
-        button(text("💾 Save").size(13)).padding([4, 10]).on_press(Msg::SaveNow),
+        button(text("💾 Save").size(13)).padding(4).on_press(Msg::SaveNow),
     ]
-    .padding([8, 12])
-    .align_y(iced::Align::Center)
+    .padding(8)
+    .align_y(iced::Alignment::Center)
     .spacing(4)
     .into()
 }
@@ -366,9 +376,9 @@ fn sidebar_view(st: &AppState) -> Element<'_, Msg> {
     );
     col = col.push(
         row![
-            button(text("🆕 Create").size(12)).padding([4, 8]).on_press(Msg::CreateNotebook),
+            button(text("🆕 Create").size(12)).padding(4).on_press(Msg::CreateNotebook),
             button(text("📥 Import .one / .onetoc2 / .onepkg").size(12))
-                .padding([4, 8])
+                .padding(4)
                 .on_press(Msg::RequestPick(PickTarget::OpenOneNote)),
         ]
         .spacing(6),
@@ -403,9 +413,9 @@ fn sidebar_view(st: &AppState) -> Element<'_, Msg> {
             );
             col = col.push(
                 row![
-                    button(text("＋ Add section").size(12)).padding([4, 8]).on_press(Msg::AddSection),
+                    button(text("＋ Add section").size(12)).padding(4).on_press(Msg::AddSection),
                     button(text("✕ Close notebook").size(12))
-                        .padding([4, 8])
+                        .padding(4)
                         .on_press(Msg::CloseNotebook(nb)),
                 ]
                 .spacing(6),
@@ -420,7 +430,7 @@ fn sidebar_view(st: &AppState) -> Element<'_, Msg> {
                     .size(13),
             );
             col =
-                col.push(button(text("＋ Add page").size(12)).padding([4, 8]).on_press(Msg::AddPage));
+                col.push(button(text("＋ Add page").size(12)).padding(4).on_press(Msg::AddPage));
         }
         None => {}
     }
@@ -460,7 +470,7 @@ fn tree_row(r: &TreeRow) -> Element<'static, Msg> {
     let selected = r.selected;
     let inner = container(text(label).size(13))
         .width(Length::Fill)
-        .padding([3, 6])
+        .padding(3)
         .style(move |_: &Theme| {
             let bg = if selected {
                 iced::Color::from_rgb(0.80, 0.88, 1.0)
@@ -478,14 +488,14 @@ fn tree_row(r: &TreeRow) -> Element<'static, Msg> {
             .width(Length::Fill)
             .style(|_: &Theme, _: iced::widget::button::Status| iced::widget::button::Style {
                 background: None,
-                text_color: None,
+                text_color: iced::Color::BLACK,
                 border: Default::default(),
                 shadow: Default::default(),
             })
             .on_press(Msg::RowSelected(r.sel)),
     )
     .width(Length::Fill)
-    .padding([0, 0, 0, indent])
+    .padding(iced::Padding::new(0.0).left(indent as f32))
     .into()
 }
 
@@ -506,11 +516,11 @@ fn canvas_column(st: &AppState) -> Element<'_, Msg> {
                 .color(iced::Color::from_rgb(0.45, 0.45, 0.5)),
         ]
         .spacing(10)
-        .align_y(iced::Align::Center),
+        .align_y(iced::Alignment::Center),
         None => row![text("No page selected — pick or create a page in the sidebar")
             .size(14)
             .color(iced::Color::from_rgb(0.5, 0.5, 0.5))]
-            .align_y(iced::Align::Center),
+            .align_y(iced::Alignment::Center),
     };
 
     let canvas = canvas::Canvas::new(Draw { st }).width(Length::Fill).height(Length::Fill);
@@ -532,22 +542,20 @@ struct DrawState {
     last: (f32, f32),
 }
 
-impl<'a> Program<Msg, DrawState> for Draw<'a> {
+impl Program<Msg> for Draw<'_> {
+    type State = DrawState;
+
     fn update(
         &self,
         ds: &mut DrawState,
         event: Event,
-        bounds: iced::Rectangle,
+        _bounds: iced::Rectangle,
         cursor: Cursor,
     ) -> (canvas::event::Status, Option<Msg>) {
-        let _ = bounds;
         let select_mode = matches!(self.st.tool, Tool::Select);
 
         match event {
-            Event::Mouse(iced::event::mouse::Event::ButtonPressed(
-                iced::event::mouse::Button::Left,
-                _,
-            )) => {
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
                 let Some(pos) = cursor.position() else {
                     return (canvas::event::Status::Ignored, None);
                 };
@@ -567,7 +575,7 @@ impl<'a> Program<Msg, DrawState> for Draw<'a> {
                     )
                 }
             }
-            Event::Mouse(iced::event::mouse::Event::CursorMoved { position, .. }) => {
+            Event::Mouse(mouse::Event::CursorMoved { position }) => {
                 if ds.panning {
                     let dx = position.x - ds.last.0;
                     let dy = position.y - ds.last.1;
@@ -589,10 +597,7 @@ impl<'a> Program<Msg, DrawState> for Draw<'a> {
                 }
                 (canvas::event::Status::Ignored, None)
             }
-            Event::Mouse(iced::event::mouse::Event::ButtonReleased(
-                iced::event::mouse::Button::Left,
-                _,
-            )) => {
+            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
                 if ds.drawing {
                     ds.drawing = false;
                     (
@@ -604,7 +609,7 @@ impl<'a> Program<Msg, DrawState> for Draw<'a> {
                     (canvas::event::Status::Captured, None)
                 }
             }
-            Event::Mouse(iced::event::mouse::Event::CursorLeaves) => {
+            Event::Mouse(mouse::Event::CursorLeft) => {
                 let was_drawing = ds.drawing;
                 ds.drawing = false;
                 ds.panning = false;
@@ -617,12 +622,15 @@ impl<'a> Program<Msg, DrawState> for Draw<'a> {
                     (canvas::event::Status::Ignored, None)
                 }
             }
-            Event::Mouse(iced::event::mouse::Event::Wheel { delta, position, .. }) => {
+            Event::Mouse(mouse::Event::WheelScrolled { delta }) => {
+                let Some(position) = cursor.position() else {
+                    return (canvas::event::Status::Ignored, None);
+                };
                 let factor = match delta {
-                    iced::event::mouse::scroll::Delta::Pixels { y, .. } if y != 0.0 => {
+                    mouse::ScrollDelta::Pixels { y, .. } if y != 0.0 => {
                         if y > 0.0 { 1.08 } else { 1.0 / 1.08 }
                     }
-                    iced::event::mouse::scroll::Delta::Lines { y, .. } if y != 0.0 => {
+                    mouse::ScrollDelta::Lines { y, .. } if y != 0.0 => {
                         if y > 0.0 { 1.15 } else { 1.0 / 1.15 }
                     }
                     _ => return (canvas::event::Status::Ignored, None),
@@ -653,11 +661,16 @@ impl<'a> Program<Msg, DrawState> for Draw<'a> {
         vec![frame.into_geometry()]
     }
 
-    fn mouse_cursor(&self) -> MouseCursor {
+    fn mouse_interaction(
+        &self,
+        _ds: &DrawState,
+        _bounds: iced::Rectangle,
+        _cursor: Cursor,
+    ) -> mouse::Interaction {
         match self.st.tool {
-            Tool::Select => MouseCursor::Grab,
-            Tool::Text => MouseCursor::Text,
-            _ => MouseCursor::Crosshair,
+            Tool::Select => mouse::Interaction::Grab,
+            Tool::Text => mouse::Interaction::Text,
+            _ => mouse::Interaction::Crosshair,
         }
     }
 }
@@ -666,7 +679,7 @@ fn to_screen(st: &AppState, p: Point) -> (f32, f32) {
     (p.x * st.view.zoom + st.view.pan_x, p.y * st.view.zoom + st.view.pan_y)
 }
 
-fn paint(frame: &mut Frame<'_>, st: &AppState) {
+fn paint(frame: &mut Frame, st: &AppState) {
     draw_grid(frame, st);
 
     // Images
@@ -676,7 +689,10 @@ fn paint(frame: &mut Frame<'_>, st: &AppState) {
         let sh = h * st.view.zoom;
         if let Some(img) = st.image_cache.get(&hash) {
             let handle = state::rgba_image_handle(img.width, img.height, img.pixels.clone());
-            frame.draw_image(iced::Rectangle { x: sx, y: sy, width: sw, height: sh }, handle);
+            frame.draw_image(
+                iced::Rectangle { x: sx, y: sy, width: sw, height: sh },
+                CanvasImage::Raster(iced::widget::graphics::image::Image::new(handle), iced::Rectangle::new(iced::Point::ORIGIN, Size::new(sw, sh))),
+            );
         } else {
             fill_rect(frame, sx, sy, sw, sh, iced::Color::from_rgb(0.90, 0.91, 0.94));
             outline_rect(frame, sx, sy, sw, sh, iced::Color::from_rgb(0.6, 0.6, 0.65));
@@ -753,9 +769,9 @@ fn paint(frame: &mut Frame<'_>, st: &AppState) {
                 size: iced::Pixels(line_h * 0.72),
                 line_height: iced::widget::text::LineHeight::default(),
                 font: iced::Font::DEFAULT,
-                horizontal_alignment: iced::Alignment::Start,
-                vertical_alignment: iced::VerticalAlignment::Top,
-                shaping: iced::widget::canvas::text::Shaping::Advanced,
+                horizontal_alignment: iced::alignment::Horizontal::Left,
+                vertical_alignment: iced::alignment::Vertical::Top,
+                shaping: iced::widget::text::Shaping::Advanced,
             });
         }
     }
@@ -773,9 +789,9 @@ fn paint(frame: &mut Frame<'_>, st: &AppState) {
             size: iced::Pixels(12.0),
             line_height: iced::widget::text::LineHeight::default(),
             font: iced::Font::DEFAULT,
-            horizontal_alignment: iced::Alignment::Start,
-            vertical_alignment: iced::VerticalAlignment::Top,
-            shaping: iced::widget::canvas::text::Shaping::Basic,
+            horizontal_alignment: iced::alignment::Horizontal::Left,
+            vertical_alignment: iced::alignment::Vertical::Top,
+            shaping: iced::widget::text::Shaping::Basic,
         });
     }
 }
@@ -800,7 +816,7 @@ fn color_of(c: Color) -> iced::Color {
 }
 
 fn stroke_geometry(
-    frame: &mut Frame<'_>,
+    frame: &mut Frame,
     st: &AppState,
     pts: &[Point],
     color: iced::Color,
@@ -810,31 +826,31 @@ fn stroke_geometry(
     if pts.len() < 2 {
         return;
     }
-    let mut path = CPath::new();
-    let mut iter = pts.iter();
-    let first = iter.next().unwrap();
-    let (x0, y0) = to_screen(st, *first);
-    path.move_to(iced::Point::new(x0, y0));
-    for p in iter {
-        let (x, y) = to_screen(st, *p);
-        path.line_to(iced::Point::new(x, y));
-    }
+    let path = CPath::new(|b| {
+        let mut iter = pts.iter();
+        let first = iter.next().unwrap();
+        let (x0, y0) = to_screen(st, *first);
+        b.move_to(iced::Point::new(x0, y0));
+        for p in iter {
+            let (x, y) = to_screen(st, *p);
+            b.line_to(iced::Point::new(x, y));
+        }
+    });
     let mut color = color;
     color.a = alpha as f32 / 255.0;
     frame.stroke(
         &path,
         CStroke {
-            style: canvas::path::Style::Solid(color),
+            style: CanvasStyle::Solid(color),
             width: width_px.max(0.7),
-            line_cap: canvas::path::LineCap::Round,
-            line_join: canvas::path::LineJoin::Round,
-            dash: canvas::path::Dash::default(),
-            transform: None,
+            line_cap: LineCap::Round,
+            line_join: LineJoin::Round,
+            line_dash: LineDash::default(),
         },
     );
 }
 
-fn draw_grid(frame: &mut Frame<'_>, st: &AppState) {
+fn draw_grid(frame: &mut Frame, st: &AppState) {
     let step = 10.0 * st.view.zoom; // 10 mm grid
     if step < 6.0 {
         return;
@@ -853,26 +869,25 @@ fn draw_grid(frame: &mut Frame<'_>, st: &AppState) {
     }
 }
 
-fn fill_rect(frame: &mut Frame<'_>, x: f32, y: f32, w: f32, h: f32, c: iced::Color) {
+fn fill_rect(frame: &mut Frame, x: f32, y: f32, w: f32, h: f32, c: iced::Color) {
     frame.fill(&CPath::rectangle(iced::Point::new(x, y), Size::new(w, h)), c);
 }
 
-fn outline_rect(frame: &mut Frame<'_>, x: f32, y: f32, w: f32, h: f32, c: iced::Color) {
+fn outline_rect(frame: &mut Frame, x: f32, y: f32, w: f32, h: f32, c: iced::Color) {
     let p = CPath::rectangle(iced::Point::new(x, y), Size::new(w, h));
     frame.stroke(
         &p,
         CStroke {
-            style: canvas::path::Style::Solid(c),
+            style: CanvasStyle::Solid(c),
             width: 1.0,
-            line_cap: canvas::path::LineCap::Butt,
-            line_join: canvas::path::LineJoin::Miter,
-            dash: canvas::path::Dash::default(),
-            transform: None,
+            line_cap: LineCap::Butt,
+            line_join: LineJoin::Miter,
+            line_dash: LineDash::default(),
         },
     );
 }
 
-fn centered_text(frame: &mut Frame<'_>, s: &str, x: f32, y: f32, w: f32, h: f32, size: f32) {
+fn centered_text(frame: &mut Frame, s: &str, x: f32, y: f32, w: f32, h: f32, size: f32) {
     frame.fill_text(CText {
         content: s.to_string(),
         position: iced::Point::new(x + w / 2.0, y + h / 2.0),
@@ -880,9 +895,9 @@ fn centered_text(frame: &mut Frame<'_>, s: &str, x: f32, y: f32, w: f32, h: f32,
         size: iced::Pixels(size),
         line_height: iced::widget::text::LineHeight::default(),
         font: iced::Font::DEFAULT,
-        horizontal_alignment: iced::Alignment::Center,
-        vertical_alignment: iced::VerticalAlignment::Center,
-        shaping: iced::widget::canvas::text::Shaping::Basic,
+        horizontal_alignment: iced::alignment::Horizontal::Center,
+        vertical_alignment: iced::alignment::Vertical::Center,
+        shaping: iced::widget::text::Shaping::Basic,
     });
 }
 
@@ -905,13 +920,13 @@ fn inspector_view(st: &AppState) -> Element<'_, Msg> {
         (140, 70, 200),
         (235, 100, 160),
     ];
-    let mut swatches = row![].spacing(6).wrap();
+    let mut swatches = iced::widget::Row::<Msg>::new().spacing(6);
     for (r, g, b) in palette {
         let c = Color::rgb(r, g, b);
         let active = st.color.r == r && st.color.g == g && st.color.b == b;
         swatches = swatches.push(
             button(text(if active { "◉" } else { "●" }).size(16))
-                .padding([2, 5])
+                .padding(2)
                 .style(move |_: &Theme, _: iced::widget::button::Status| {
                     iced::widget::button::Style {
                         background: Some(iced::Background::Color(iced::Color::from_rgb(
@@ -919,7 +934,7 @@ fn inspector_view(st: &AppState) -> Element<'_, Msg> {
                             g as f32 / 255.0,
                             b as f32 / 255.0,
                         ))),
-                        text_color: Some(iced::Color::WHITE),
+                        text_color: iced::Color::WHITE,
                         border: iced::Border {
                             radius: 6.0.into(),
                             width: if active { 2.0 } else { 0.0 },
@@ -942,12 +957,12 @@ fn inspector_view(st: &AppState) -> Element<'_, Msg> {
 
     col = col.push(
         row![
-            button(text("↶ Undo").size(12)).padding([4, 8]).on_press(Msg::Undo),
+            button(text("↶ Undo").size(12)).padding(4).on_press(Msg::Undo),
             button(text("🖼 Insert image").size(12))
-                .padding([4, 8])
+                .padding(4)
                 .on_press(Msg::RequestPick(PickTarget::InsertImage)),
             button(text("📎 Attach file").size(12))
-                .padding([4, 8])
+                .padding(4)
                 .on_press(Msg::RequestPick(PickTarget::InsertFile)),
         ]
         .spacing(6)
@@ -957,7 +972,7 @@ fn inspector_view(st: &AppState) -> Element<'_, Msg> {
     if st.is_read_only() {
         col = col.push(
             button(text("🔓 Upgrade section to editable").size(12))
-                .padding([6, 8])
+                .padding(6)
                 .width(Length::Fill)
                 .on_press(Msg::UpgradeSection),
         );
@@ -976,7 +991,7 @@ fn inspector_view(st: &AppState) -> Element<'_, Msg> {
                     if p.tag == Some(NoteTag::ToDo) {
                         line = line.push(button(
                             text(if p.checked_ { "☑" } else { "☐" }).size(14))
-                            .padding([2, 4])
+                            .padding(2)
                             .on_press(Msg::CanvasEvent(CanvasMsg::ToggleCheck(idx))),
                         );
                     }
@@ -1036,10 +1051,10 @@ fn search_hit_row(h: &SearchHit) -> Element<'static, Msg> {
             text(h.snippet.clone()).size(11).color(iced::Color::from_rgb(0.35, 0.35, 0.4)),
         ]
         .spacing(2)
-        .padding([4, 6]),
+        .padding(4),
     )
     .width(Length::Fill)
-    .style(move |th: &Theme, status| theme::Button::secondary(th, status))
+    .style(move |th: &Theme, status| iced::widget::button::secondary(th, status))
     .on_press(Msg::OpenHit(hit))
     .into()
 }
@@ -1060,8 +1075,8 @@ fn status_bar(st: &AppState) -> Element<'_, Msg> {
                 .size(11)
                 .color(iced::Color::from_rgb(0.5, 0.55, 0.6)),
         ]
-        .padding([6, 12])
-        .align_y(iced::Align::Center),
+        .padding(6)
+        .align_y(iced::Alignment::Center),
     )
     .width(Length::Fill)
     .style(|_: &Theme| container::Style {

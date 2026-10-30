@@ -387,11 +387,12 @@ impl AppState {
             self.status = "Open a notebook first".into();
             return;
         };
-        let name = if self.new_section_name.trim().is_empty() {
-            "New Section"
+        let name: String = if self.new_section_name.trim().is_empty() {
+            "New Section".into()
         } else {
-            self.new_section_name.trim()
+            self.new_section_name.trim().to_owned()
         };
+        let name: &str = &name;
         match self.store.create_section(nb, name) {
             Ok(sid) => {
                 self.new_section_name.clear();
@@ -404,11 +405,12 @@ impl AppState {
     }
 
     pub fn create_notebook(&mut self, root: &Path) {
-        let name = if self.new_notebook_name.trim().is_empty() {
-            "My Notebook"
+        let name: String = if self.new_notebook_name.trim().is_empty() {
+            "My Notebook".into()
         } else {
-            self.new_notebook_name.trim()
+            self.new_notebook_name.trim().to_owned()
         };
+        let name: &str = &name;
         match leafnote_core::store::create_notebook(root, name) {
             Ok(nb) => {
                 let path = nb.path.clone();
@@ -604,20 +606,24 @@ impl AppState {
     pub fn toggle_checked(&mut self, idx: usize) {
         let Some(page) = self.page().cloned() else { return };
         let mut page = page;
+        let mut flipped = false;
         for b in &mut page.blocks {
             if let Block::Outline { paragraphs, .. } = b {
                 if let Some(p) = paragraphs.get_mut(idx) {
                     if p.tag == Some(NoteTag::ToDo) {
                         p.checked_ = !p.checked_;
-                        page.touch();
-                        self.dirty = true;
-                        if let Some(section) = self.current_section_id() {
-                            self.store.save_page(section, &page).ok();
-                        }
-                        self.reindex_all();
+                        flipped = true;
                     }
                 }
             }
+        }
+        if flipped {
+            page.touch();
+            self.dirty = true;
+            if let Some(section) = self.current_section_id() {
+                self.store.save_page(section, &page).ok();
+            }
+            self.reindex_all();
         }
     }
 
@@ -987,7 +993,7 @@ fn unwrap_page(store: &Store, id: Option<Id>) -> Page {
 }
 
 fn guess_mime(path: &Path) -> &'static str {
-    match path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()) {
+    match path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref() {
         Some("png") => "image/png",
         Some("jpg") | Some("jpeg") => "image/jpeg",
         Some("gif") => "image/gif",
@@ -1200,7 +1206,7 @@ pub fn inflate(data: &[u8]) -> Option<Vec<u8>> {
             }
             _ => return None,
         }
-        if bfinal {
+        if bfinal != 0 {
             break;
         }
     }
